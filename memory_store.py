@@ -1,70 +1,124 @@
-import chromadb
-import json
-import hashlib
-from datetime import datetime
-from pathlib import Path
-from sentence_transformers import SentenceTransformer
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
+from uuid import uuid4
 
-DB_PATH = Path(__file__).parent / "data" / "memory"
-DB_PATH.mkdir(parents=True, exist_ok=True)
 
-# Lightweight local embedding model — no internet needed after first download
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+try:
+    import chromadb
+except ImportError:
+    chromadb = None
 
-client = chromadb.PersistentClient(path=str(DB_PATH))
 
-# Two collections — one for conversation history, one for facts about the user
-conversations = client.get_or_create_collection("conversations")
-user_facts = client.get_or_create_collection("user_facts")
+@dataclass
+class MemoryHit:
+    text: str
+    metadata: dict[str, Any]
+    score: float
 
-def save_exchange(user_text: str, friday_text: str):
-    """Save a full exchange to persistent memory."""
-    timestamp = datetime.now().isoformat()
-    doc = f"User: {user_text}\nFRIDAY: {friday_text}"
-    doc_id = hashlib.md5(f"{timestamp}{user_text}".encode()).hexdigest()
-    embedding = embedder.encode(doc).tolist()
-    conversations.add(
-        documents=[doc],
-        embeddings=[embedding],
-        ids=[doc_id],
-        metadatas=[{"timestamp": timestamp, "user": user_text, "friday": friday_text}]
-    )
 
-def recall(query: str, n=3) -> list[str]:
-    """Find the most relevant past exchanges for the current query."""
-    if conversations.count() == 0:
-        return []
-    embedding = embedder.encode(query).tolist()
-    results = conversations.query(
-        query_embeddings=[embedding],
-        n_results=min(n, conversations.count())
-    )
-    return results["documents"][0] if results["documents"] else []
+class MemoryStore:
+    def __init__(self, persist_directory: str = "memory_db") -> None:
+        self.persist_directory = persist_directory
+        self._client = None
+        self._short_term = None
+        self._long_term = None
+        self._fallback_short: list[dict[str, Any]] = []
+        self._fallback_long: list[dict[str, Any]] = []
 
-def save_fact(key: str, value: str):
-    """Save a persistent fact about the user — name, preferences, habits."""
-    doc_id = hashlib.md5(key.encode()).hexdigest()
-    embedding = embedder.encode(f"{key}: {value}").tolist()
-    # Upsert — overwrite if key already exists
-    try:
-        user_facts.delete(ids=[doc_id])
-    except Exception:
-        pass
-    user_facts.add(
-        documents=[f"{key}: {value}"],
-        embeddings=[embedding],
-        ids=[doc_id],
-        metadatas=[{"key": key, "value": value, "updated": datetime.now().isoformat()}]
-    )
+    def initialize(self) -> None:
+        if chromadb is None:
+            return
 
-def get_all_facts() -> str:
-    """Return all stored user facts as a formatted string for the system prompt."""
-    if user_facts.count() == 0:
-        return ""
-    results = user_facts.get()
-    if not results["documents"]:
-        return ""
-    return "\n".join(results["documents"])
+        self._client = chromadb.PersistentClient(path=self.persist_directory)
+        self._short_term = self._client.get_or_create_collection("short_term_memory")
+        self._long_term = self._client.get_or_create_collection("long_term_memory")
 
-def get_memory_count() -> int:
-    return conversations.count()
+    async def initialize_async(self) -> None:
+        await asyncio.to_thread(self.initialize)
+
+    def _add_fallback(self, bucket: list[dict[str, Any]], text: str, metadata: dict[str, Any]) -> None:
+        bucket.append({"id": str(uuid4()), "text": text, "metadata": metadata})
+
+    def remember_short_term(self, text: str, metadata: dict[str, Any] | None = None) -> None:
+        metadata = metadata or {}
+        metadata.setdefault("created_at", datetime.utcnow().isoformat())
+        if self._short_term is not None:
+            self._short_term.add(documents=[text], metadatas=[metadata], ids=[str(uuid4())])
+            return
+        self._add_fallback(self._fallback_short, text, metadata)
+
+    async def remember_short_term_async(self, text: str, metadata: dict[str, Any] | None = None) -> None:
+        await asyncio.to_thread(self.remember_short_term, text, metadata)
+
+    def remember_long_term(self, text: str, metadata: dict[str, Any] | None = None) -> None:
+        metadata = metadata or {}
+        metadata.setdefault("created_at", datetime.utcnow().isoformat())
+        if self._long_term is not None:
+            self._long_term.add(documents=[text], metadatas=[metadata], ids=[str(uuid4())])
+            return
+        self._add_fallback(self._fallback_long, text, metadata)
+
+    async def remember_long_term_async(self, text: str, metadata: dict[str, Any] | None = None) -> None:
+        await asyncio.to_thread(self.remember_long_term, text, metadata)
+
+    def _search_fallback(
+        self,
+        bucket: list[dict[str, Any]],
+        query: str,
+        limit: int,
+        hours: int | None = None,
+    ) -> list[MemoryHit]:
+        now = datetime.utcnow()
+        terms = set(query.lower().split())
+        hits: list[MemoryHit] = []
+
+        for item in reversed(bucket):
+            created_at = item["metadata"].get("created_at")
+            if hours and created_at:
+                try:
+                    age = now - datetime.fromisoformat(created_at)
+                    if age > timedelta(hours=hours):
+                        continue
+                except ValueError:
+                    pass
+
+            text = item["text"]
+            overlap = sum(1 for token in text.lower().split() if token in terms)
+            if overlap:
+                hits.append(MemoryHit(text=text, metadata=item["metadata"], score=float(overlap)))
+            if len(hits) >= limit:
+                break
+
+        return hits
+
+    def recall(self, query: str, short_limit: int = 3, long_limit: int = 3) -> list[MemoryHit]:
+        hits: list[MemoryHit] = []
+
+        if self._short_term is not None:
+            short = self._short_term.query(query_texts=[query], n_results=short_limit)
+            for doc, meta, distance in zip(
+                short.get("documents", [[]])[0],
+                short.get("metadatas", [[]])[0],
+                short.get("distances", [[]])[0] if short.get("distances") else [0.0] * short_limit,
+            ):
+                hits.append(MemoryHit(text=doc, metadata=meta or {}, score=float(distance)))
+        else:
+            hits.extend(self._search_fallback(self._fallback_short, query, short_limit, hours=6))
+
+        if self._long_term is not None:
+            long = self._long_term.query(query_texts=[query], n_results=long_limit)
+            for doc, meta, distance in zip(
+                long.get("documents", [[]])[0],
+                long.get("metadatas", [[]])[0],
+                long.get("distances", [[]])[0] if long.get("distances") else [0.0] * long_limit,
+            ):
+                hits.append(MemoryHit(text=doc, metadata=meta or {}, score=float(distance)))
+        else:
+            hits.extend(self._search_fallback(self._fallback_long, query, long_limit))
+
+        return hits
+
+    async def recall_async(self, query: str, short_limit: int = 3, long_limit: int = 3) -> list[MemoryHit]:
+        return await asyncio.to_thread(self.recall, query, short_limit, long_limit)

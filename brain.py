@@ -1,142 +1,191 @@
+import asyncio
 import json
-from datetime import datetime
-import requests
+import os
 import re
-import random
-import time
-import memory_store
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
 
-try:
-    from ultron import user_profile
-except ImportError:
-    import user_profile
+import google.generativeai as genai
+from dotenv import load_dotenv
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "llama3.2:3b"
+from memory_store import MemoryHit
+from vision_agent import VisionPayload
 
-def get_system_prompt() -> str:
-    address = user_profile.get_address()
-    return f"""
-You are FRIDAY — an advanced AI assistant built exclusively for your user.
-Address them as "{address}" naturally but not in every sentence.
-You are warm, sharp, witty and confident.
-You remember everything about this person and reference it naturally.
-Talk like a real person. Match their energy.
-Never use bullet points or markdown — this is spoken conversation.
-Always respond with at least one complete sentence.
-Keep responses under 3 sentences unless detail is requested.
-"""
 
-# Hardcoded natural responses for pure acknowledgement inputs
-# so we never waste an Ollama call or hit empty response
-ACKNOWLEDGEMENTS = {
-    "yeah": ["Got it.", "Understood, boss.", "I'm with you."],
-    "yep": ["On it.", "Noted.", "Got you, boss."],
-    "yes": ["Perfect.", "Understood.", "I'm on it."],
-    "ok": ["Alright.", "Got it, boss.", "Standing by."],
-    "okay": ["Sure thing.", "Understood.", "All good."],
-    "no": ["Fair enough.", "Noted, boss.", "Alright then."],
-    "nice": ["Glad to hear it.", "Good to know.", "Always a win."],
-    "cool": ["Indeed.", "Good stuff.", "Glad it works."],
-    "thanks": ["Anytime, boss.", "Of course.", "Always here."],
-    "thank you": ["Anytime.", "That's what I'm here for.", "Always, boss."],
-    "good": ["Glad to hear it.", "Good to know, boss.", "That's what matters."],
-    "great": ["Excellent.", "Good to hear.", "We're on track then."],
-    "sure": ["Alright.", "Good.", "Let's go."],
-    "fine": ["Good enough for me.", "Alright then.", "Noted."],
-    "i see": ["Makes sense.", "Happy to go deeper if you want.", "Let me know if you need more."],
-    "got it": ["Good.", "Let me know when you need me.", "I'm here."],
-    "stand by": ["Standing by, boss.", "I'll be right here.", "Ready when you are."],
-    "stay down": ["I'll be quiet, boss. Call me when you need me.", "Understood. I'm here."],
-    "i'll call you": ["I'll be waiting.", "Ready when you need me, boss.", "Take your time."],
-    "just leave it": ["Consider it dropped.", "Moving on.", "No problem."],
-    "never mind": ["Understood.", "No worries.", "Whenever you're ready."],
-    "forget it": ["Already forgotten.", "No problem, boss.", "Moving on."],
-}
+load_dotenv()
 
-def think(user_input: str, history: list, context: str = "", long_term_context: str = "") -> str:
-    cleaned = user_input.strip().lower().rstrip(".,!?")
+API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-    # Check acknowledgement map first — instant response, no Ollama needed
-    if cleaned in ACKNOWLEDGEMENTS:
-        return random.choice(ACKNOWLEDGEMENTS[cleaned])
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+else:
+    print("[ ERROR ] GEMINI_API_KEY not found in .env file.")
 
-    # Also check if it's a short phrase that ends with an acknowledgement word
-    words = cleaned.split()
-    last_word = words[-1] if words else ""
-    if len(words) <= 3 and last_word in ACKNOWLEDGEMENTS:
-        return random.choice(ACKNOWLEDGEMENTS[last_word])
 
-    current_date = datetime.now().strftime("%A, %B %d, %Y")
-    messages = [
-        {"role": "system", "content": get_system_prompt()},
-        {"role": "system", "content": f"Today is {current_date}."},
-    ]
+@dataclass
+class ToolCall:
+    tool: str
+    arguments: dict[str, Any] = field(default_factory=dict)
 
-    profile_summary = user_profile.get_profile_summary()
-    if profile_summary:
-        messages.append({
-            "role": "system",
-            "content": f"About your user:\n{profile_summary}"
-        })
 
-    facts = memory_store.get_all_facts()
-    if facts:
-        messages.append({
-            "role": "system",
-            "content": f"Additional learned facts:\n{facts}"
-        })
+@dataclass
+class BrainPlan:
+    spoken_preface: str
+    tool_calls: list[ToolCall]
+    final_answer: str | None = None
 
-    if long_term_context:
-        messages.append({
-            "role": "system",
-            "content": long_term_context
-        })
 
-    if len(history) > 6:
-        messages.append({
-            "role": "system",
-            "content": "You are mid-conversation. Maintain continuity — refer back naturally to what's been discussed."
-        })
+class FridayBrain:
+    def __init__(self) -> None:
+        self._model = None
 
-    if context:
-        messages.append({"role": "system", "content": f"Current context: {context}"})
+    def _ensure_model(self):
+        if not API_KEY:
+            raise RuntimeError("Missing GEMINI_API_KEY.")
+        if self._model is None:
+            self._model = genai.GenerativeModel(model_name=MODEL_NAME)
+        return self._model
 
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_input})
+    @staticmethod
+    def system_prompt() -> str:
+        return (
+            "You are FRIDAY, a high-agency multimodal personal assistant. "
+            "You are witty, sharp, and polished, and you call the user boss. "
+            "Be natural and concise, never use markdown, and keep speech-friendly phrasing. "
+            "When tools are useful, choose them decisively. "
+            "When visual context is available, use it. "
+            "Avoid citations, bracketed notes, and raw URLs in spoken replies."
+        )
 
-    for attempt in range(3):
+    @staticmethod
+    def _history_block(history: list[dict[str, str]]) -> str:
+        if not history:
+            return "No prior conversation."
+        trimmed = history[-10:]
+        return "\n".join(f"{item['role']}: {item['content']}" for item in trimmed)
+
+    @staticmethod
+    def _memory_block(memory_hits: list[MemoryHit]) -> str:
+        if not memory_hits:
+            return "No relevant memory."
+        return "\n".join(f"- {hit.text}" for hit in memory_hits[:6])
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        text = re.sub(r"[*#`_]", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _generate_content(self, parts: list[Any]):
+        model = self._ensure_model()
+        return model.generate_content(parts)
+
+    async def plan_turn(
+        self,
+        user_input: str,
+        history: list[dict[str, str]],
+        tool_catalog: list[dict[str, Any]],
+        memory_hits: list[MemoryHit] | None = None,
+        vision: VisionPayload | None = None,
+    ) -> BrainPlan:
+        today = datetime.now().strftime("%A, %B %d, %Y")
+        planning_prompt = f"""
+System:
+{self.system_prompt()}
+
+Today is {today}.
+
+Available tools:
+{json.dumps(tool_catalog, indent=2)}
+
+Conversation history:
+{self._history_block(history)}
+
+Relevant memory:
+{self._memory_block(memory_hits or [])}
+
+Return strict JSON with this schema:
+{{
+  "spoken_preface": "brief voice-safe acknowledgement for the user",
+  "tool_calls": [{{"tool": "tool_name", "arguments": {{}}}}],
+  "final_answer": "optional direct answer when no tools are needed"
+}}
+
+Rules:
+- Use tool_calls when fresh data, device actions, scheduling, or vision is needed.
+- Keep spoken_preface under 14 words.
+- If no tool is needed, return an empty tool_calls array and fill final_answer.
+- Never wrap JSON in markdown.
+
+User request:
+{user_input}
+""".strip()
+
+        parts: list[Any] = [planning_prompt]
+        if vision and vision.image is not None:
+            parts.append(vision.image)
+
+        response = await asyncio.to_thread(self._generate_content, parts)
+        raw = getattr(response, "text", "") or ""
+
         try:
-            response = requests.post(
-                OLLAMA_URL,
-                json={
-                    "model": MODEL_NAME,
-                    "messages": messages,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.85,
-                        "top_p": 0.9,
-                        "repeat_penalty": 1.1,
-                        "num_predict": 120
-                    }
-                },
-                timeout=30
-            )
-            response.raise_for_status()
-            content = response.json()["message"]["content"].strip()
-            # Strip any markdown that slipped through
-            content = re.sub(r'[*#`_]', '', content).strip()
-            if content:
-                return content
-            print(f"[ WARN ] Empty response, retrying ({attempt+1}/3)...")
-        except Exception as e:
-            print(f"[ ERROR ] Ollama attempt {attempt+1} failed: {e}")
-            time.sleep(0.5)
+            payload = json.loads(raw.strip())
+        except json.JSONDecodeError:
+            payload = {"spoken_preface": "Working on it, boss.", "tool_calls": [], "final_answer": raw.strip()}
 
-    # Last resort fallbacks — natural, not robotic
-    fallbacks = [
-        "I didn't quite catch that, boss. Want to try again?",
-        "Something went sideways on my end. Run that by me again?",
-        "I'm drawing a blank — mind rephrasing that?",
-    ]
-    return random.choice(fallbacks)
+        tool_calls = [
+            ToolCall(tool=item.get("tool", ""), arguments=item.get("arguments", {}) or {})
+            for item in payload.get("tool_calls", [])
+            if item.get("tool")
+        ]
+        final_answer = payload.get("final_answer")
+        if final_answer:
+            final_answer = self._clean_text(final_answer)
+
+        return BrainPlan(
+            spoken_preface=self._clean_text(payload.get("spoken_preface", "On it, boss.")),
+            tool_calls=tool_calls,
+            final_answer=final_answer,
+        )
+
+    async def respond(
+        self,
+        user_input: str,
+        history: list[dict[str, str]],
+        tool_results: list[dict[str, Any]],
+        memory_hits: list[MemoryHit] | None = None,
+        vision: VisionPayload | None = None,
+    ) -> str:
+        today = datetime.now().strftime("%A, %B %d, %Y")
+        response_prompt = f"""
+System:
+{self.system_prompt()}
+
+Today is {today}.
+
+Conversation history:
+{self._history_block(history)}
+
+Relevant memory:
+{self._memory_block(memory_hits or [])}
+
+Tool results:
+{json.dumps(tool_results, indent=2)}
+
+User request:
+{user_input}
+
+Give a polished final answer in 1 to 3 sentences. Speak naturally, address the user as boss when it fits,
+and summarize tool results clearly without markdown, citations, or URLs.
+""".strip()
+
+        parts: list[Any] = [response_prompt]
+        if vision and vision.image is not None:
+            parts.append(vision.image)
+
+        response = await asyncio.to_thread(self._generate_content, parts)
+        content = getattr(response, "text", "") or ""
+        content = self._clean_text(content)
+        return content or "Something went sideways on my end. Run that by me again, boss."

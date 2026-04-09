@@ -1,219 +1,179 @@
+import asyncio
 import os
-import re
 import sys
-import time
+from pathlib import Path
+
 from dotenv import load_dotenv
+from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtWidgets import QApplication
+
+from brain import FridayBrain
+from ears import AudioInput
+from gui import UltronGUI
+from mcp_server import MCPToolServer
+from memory_store import MemoryStore
+from voice import SpeechEngine
+
 
 load_dotenv()
 
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QThread, pyqtSignal
 
-from gui import UltronGUI
-from memory import Memory
-import voice  # Load Piper first
-import ears   # Load Whisper second
-from brain import think
-import calendar_tool
-import memory_store
-import fact_extractor
-import chromadb
-import research_agent
-
-try:
-    from ultron import onboarding, user_profile
-except ImportError:
-    import onboarding
-    import user_profile
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  UltronWorker — runs the assistant loop in a background QThread
-# ═══════════════════════════════════════════════════════════════════════════
-class UltronWorker(QThread):
-    """Background thread that runs the ULTRON conversation loop."""
-
-    # Signals for thread-safe GUI updates
-    state_changed    = pyqtSignal(str)
-    user_spoke       = pyqtSignal(str)
+class FridayWorker(QThread):
+    state_changed = pyqtSignal(str)
+    user_spoke = pyqtSignal(str)
     ultron_responded = pyqtSignal(str)
-    audio_level      = pyqtSignal(float)
+    audio_level = pyqtSignal(float)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._running = True
+        self.history: list[dict[str, str]] = []
+        self.brain = FridayBrain()
+        self.ears = AudioInput()
+        self.voice = SpeechEngine()
+        self.memory = MemoryStore(str(Path(__file__).parent / "memory_db"))
+        self.tools = MCPToolServer(root_dir=Path(__file__).parent)
+        self._livekit_enabled = bool(os.getenv("LIVEKIT_URL") and os.getenv("LIVEKIT_API_KEY"))
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    def stop(self):
-        """Request the worker to stop gracefully."""
+    def stop(self) -> None:
         self._running = False
+        self.ears.stop()
 
-    def _has_search_intent(self, text_lower: str) -> bool:
-        triggers = [
-            "search",
-            "online",
-            "lookup",
-            "look up",
-            "who is",
-            "latest",
-            "match",
-            "fixtures",
-        ]
-        return any(trigger in text_lower for trigger in triggers)
+    def run(self) -> None:
+        asyncio.run(self._main())
 
-    def _sanitize_for_speech(self, text: str) -> str:
-        cleaned = re.sub(r"[*#`_>\[\]]", "", text)
-        cleaned = re.sub(r"^\s*[-•]\s*", "", cleaned, flags=re.MULTILINE)
-        cleaned = re.sub(r"^\s*\d+\.\s*", "", cleaned, flags=re.MULTILINE)
-        cleaned = re.sub(r"\((?:Source|source):\s*[^)]+\)", "", cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        return cleaned
+    async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        if not os.getenv("GEMINI_API_KEY"):
+            warning = "Missing GEMINI_API_KEY in .env. Please add it and restart."
+            self.ultron_responded.emit(warning)
+            self.state_changed.emit("idle")
+            return
 
-    def run(self):
-        mem = Memory(capacity=30)
+        await self.memory.initialize_async()
+        await self.ears.calibrate_async()
 
-        user_profile.load()
-        user_profile.record_session()
-        onboarding.run_if_needed()
-
-        # Calibrate RMS thresholds using ambient room noise
-        ears.calibrate()
-
-        # Report persistent memory stats
-        count = memory_store.get_memory_count()
-        print(f"[ FRIDAY ] Memory loaded. {count} past exchanges remembered.")
-
+        greeting = "FRIDAY Mark 3 online. Ready when you are, boss."
         self.state_changed.emit("speaking")
-        greeting = user_profile.get_greeting()
-        print(f"[ FRIDAY ] {greeting}")
-        voice.speak(greeting)
+        self.ultron_responded.emit(greeting)
+        await self.voice.speak(greeting)
+        self.state_changed.emit("idle")
 
         while self._running:
             try:
-                # 1. Listen
-                self.state_changed.emit("listening")
-                
-                # Blocks until speech completes -> mic is fully closed inside
-                user_text = ears.listen(on_audio_level=self.audio_level.emit)
-
-                if not self._running:
-                    break
-
-                if not user_text or len(user_text.strip()) < 2:
-                    continue  # Ignore empty or microscopic clips
-
-                print(f"[ YOU ] {user_text}")
-                self.user_spoke.emit(user_text)
-                text_lower = user_text.lower()
-
-                # Memory-clear voice command
-                if "clear your memory" in text_lower or "forget everything" in text_lower:
-                    client = chromadb.PersistentClient(path=str(memory_store.DB_PATH))
-                    client.delete_collection("conversations")
-                    client.delete_collection("user_facts")
-                    response_text = f"Memory wiped clean, {user_profile.get_address()}. Starting fresh."
-                    print(f"[ FRIDAY ] {response_text}")
-                    self.ultron_responded.emit(response_text)
-                    self.state_changed.emit("speaking")
-                    voice.speak(response_text)
-                    self.state_changed.emit("idle")
-                    time.sleep(1.5)
-                    continue
-
-                if "shutdown friday" in text_lower or "shutdown ultron" in text_lower:
-                    self.state_changed.emit("speaking")
-                    goodbye = f"Shutting down. Take care, {user_profile.get_address()}."
-                    voice.speak(goodbye)
-                    self.ultron_responded.emit(goodbye)
-                    self._running = False
-                    break
-
-                if any(p in text_lower for p in ["keep it short", "be more concise", "shorter answers"]):
-                    user_profile.update("response_style", "concise")
-                    voice.speak("Got it, I'll keep things brief.")
-                    continue
-                elif any(p in text_lower for p in ["more detail", "be more detailed", "explain more", "give me more detail"]):
-                    user_profile.update("response_style", "detailed")
-                    voice.speak("Sure, I'll give you more depth going forward.")
-                    continue
-                elif any(p in text_lower for p in ["be normal", "balanced responses"]):
-                    user_profile.update("response_style", "balanced")
-                    voice.speak("Understood. I'll keep things balanced.")
-                    continue
-
-                if "remember that" in text_lower or "make a note that" in text_lower:
-                    note_match = re.split(r"remember that|make a note that", user_text, maxsplit=1, flags=re.IGNORECASE)
-                    note_content = note_match[-1].strip() if note_match else ""
-                    if note_content:
-                        user_profile.update("notes", note_content)
-                        voice.speak("Got it, I'll remember that.")
-                        continue
-
-                # Extract and save any facts the user just shared
-                facts = fact_extractor.extract_and_save(user_text)
-                for key, value in facts:
-                    memory_store.save_fact(key, value)
-                    print(f"[ FRIDAY ] Learned: {key} = {value}")
-
-                # Retrieve semantically relevant past context
-                from memory import get_relevant_context
-                long_term_context = get_relevant_context(user_text)
-
-                # 3. Calendar Check
-                context = ""
-                if any(w in user_text.lower() for w in ["calendar", "schedule", "today", "meeting"]):
-                    self.state_changed.emit("thinking")
-                    context = calendar_tool.get_today_events()
-
-                if self._has_search_intent(text_lower):
-                    self.state_changed.emit("thinking")
-                    web_context = research_agent.search_web(user_text)
-                    context = f"{context}\n\n{web_context}".strip() if context else web_context
-
-                # 4. Think 
-                self.state_changed.emit("thinking")
-                response_text = think(user_text, mem.get_history(), context=context, long_term_context=long_term_context)
-                response_text = self._sanitize_for_speech(response_text)
-
-                if not self._running:
-                    break
-
-                if not response_text or not response_text.strip():
-                    print("[ WARN ] Got empty response after retries, skipping")
-                    self.state_changed.emit("idle")
-                    time.sleep(0.5)
-                    continue
-
-
-                mem.add_interaction("user", user_text)
-                mem.add_interaction("assistant", response_text)
-                from memory import persist_exchange
-                persist_exchange(user_text, response_text)  # save to ChromaDB
-                user_profile.record_exchange()
-                print(f"[ FRIDAY ] {response_text}")
-                self.ultron_responded.emit(response_text)
-
-                # 5. Speak (mic is NOT open)
-                self.state_changed.emit("speaking")
-                voice.speak(response_text)
-
-                # 6. Cooldown
+                await self._run_single_turn()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                print(f"[ Worker Error ] {exc}")
                 self.state_changed.emit("idle")
-                time.sleep(1.5)
+                await asyncio.sleep(0.5)
 
-            except Exception as e:
-                print(f"[ Worker Error ] {e}")
-                time.sleep(0.5)
-                continue
+        await self.voice.stop()
+
+    async def _run_single_turn(self) -> None:
+        if self._livekit_enabled:
+            self.state_changed.emit("thinking")
+            status = (
+                "LiveKit credentials detected, boss, but this desktop build is using the "
+                "local audio fallback until the room transport is configured."
+            )
+            self.ultron_responded.emit(status)
+            await self.voice.speak(status)
+            self._livekit_enabled = False
+            self.state_changed.emit("idle")
+            return
+
+        def on_speech_start() -> None:
+            if self._loop is None:
+                return
+            self._loop.call_soon_threadsafe(asyncio.create_task, self.voice.stop())
+
+        self.state_changed.emit("listening")
+        user_text = await self.ears.listen_async(
+            on_audio_level=self.audio_level.emit,
+            on_speech_start=on_speech_start,
+        )
+
+        if not self._running or not user_text or len(user_text.strip()) < 2:
+            self.state_changed.emit("idle")
+            return
+
+        self.user_spoke.emit(user_text)
+        text_lower = user_text.lower()
+        if "shutdown friday" in text_lower or "exit assistant" in text_lower:
+            goodbye = "Shutting down. Take care, boss."
+            self.state_changed.emit("speaking")
+            self.ultron_responded.emit(goodbye)
+            await self.voice.speak(goodbye)
+            self._running = False
+            return
+
+        self.state_changed.emit("thinking")
+        memory_hits = await self.memory.recall_async(user_text)
+        latest_vision = self.tools.vision.latest()
+        plan = await self.brain.plan_turn(
+            user_input=user_text,
+            history=self.history,
+            tool_catalog=self.tools.list_tools(),
+            memory_hits=memory_hits,
+            vision=latest_vision,
+        )
+
+        if plan.tool_calls and plan.spoken_preface:
+            self.state_changed.emit("speaking")
+            self.ultron_responded.emit(plan.spoken_preface)
+            await self.voice.speak(plan.spoken_preface)
+            self.state_changed.emit("thinking")
+
+        tool_results: list[dict[str, object]] = []
+        for call in plan.tool_calls:
+            result = await self.tools.execute_tool(call.tool, call.arguments)
+            tool_results.append({"tool": call.tool, "arguments": call.arguments, "result": result})
+            await self.memory.remember_short_term_async(
+                f"Tool {call.tool} called with {call.arguments} and returned {result}",
+                metadata={"kind": "tool_result"},
+            )
+            if call.tool == "vision_capture" and result.get("ok"):
+                latest_vision = self.tools.vision.latest()
+
+        if tool_results:
+            final_text = await self.brain.respond(
+                user_input=user_text,
+                history=self.history,
+                tool_results=tool_results,
+                memory_hits=memory_hits,
+                vision=latest_vision,
+            )
+        else:
+            final_text = plan.final_answer or "I need another pass at that, boss."
+
+        self.history.append({"role": "user", "content": user_text})
+        self.history.append({"role": "assistant", "content": final_text})
+        self.history = self.history[-12:]
+
+        await self.memory.remember_short_term_async(
+            f"User said: {user_text}\nAssistant replied: {final_text}",
+            metadata={"kind": "conversation"},
+        )
+        if any(token in text_lower for token in ["remember", "favorite", "prefer", "my name is", "i like"]):
+            await self.memory.remember_long_term_async(
+                user_text,
+                metadata={"kind": "user_fact"},
+            )
+
+        self.ultron_responded.emit(final_text)
+        self.state_changed.emit("speaking")
+        await self.voice.speak(final_text)
+        self.state_changed.emit("idle")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Entry Point
-# ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     window = UltronGUI()
-    worker = UltronWorker()
+    worker = FridayWorker()
 
     worker.state_changed.connect(window.on_state_changed)
     worker.user_spoke.connect(window.on_user_spoke)

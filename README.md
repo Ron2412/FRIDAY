@@ -1,6 +1,6 @@
 # FRIDAY - Personal AI Assistant
 
-A fully local (except for Google Calendar and initial STT model checks), voice-first AI assistant built with python.
+A multimodal FRIDAY desktop assistant built with Python, Gemini 2.5 Flash, MCP-style tool routing, and an async runtime designed for voice-first interaction.
 
 ## Prerequisites & System Setup
 
@@ -20,22 +20,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Ollama Setup
-You mentioned Ollama is already installed on your Mac. You simply need to ensure the right model is pulled and running.
-FRIDAY is configured to use `llama3.2:3b`.
-```bash
-ollama pull llama3.2:3b
-# Ensure Ollama is running in the background (usually the desktop app takes care of this).
-```
-
-### 4. OpenWakeWord Engine
-FRIDAY uses [OpenWakeWord](https://github.com/dscripka/openWakeWord) to detect a wake word. 
-We use the built-in `hey_jarvis` model. 
-No API keys or cloud accounts are required as it runs completely locally!
-
-*Note: You can trigger the assistant by saying "Hey Jarvis".*
-
-### 5. Google Calendar Setup
+### 3. Google Calendar Setup
 You need OAuth 2.0 Client credentials to read from your calendar.
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
 2. Create a new project.
@@ -44,6 +29,17 @@ You need OAuth 2.0 Client credentials to read from your calendar.
 5. Choose "Desktop app" (or similar).
 6. Download the resulting JSON file and save it as `credentials.json` directly inside the `ultron/` folder.
 7. The first time you ask FRIDAY to check your calendar, a browser window will pop up asking for your authorization.
+
+### 4. Optional LiveKit Setup
+To move beyond the local microphone loop and into a room-based full-duplex setup, define:
+
+```bash
+LIVEKIT_URL=...
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+```
+
+The current desktop runtime detects these variables and is structured for LiveKit transport, while still falling back to local audio if room wiring is not yet enabled.
 
 ## Voice Model
 On first run, FRIDAY will automatically download the Piper TTS voice model (~60MB) from HuggingFace. This is a one-time download. After that, everything runs 100% offline with no internet required.
@@ -55,3 +51,18 @@ Once everything is set up, run:
 ```bash
 python main.py
 ```
+
+## Running The MCP Tool Server
+To expose the FRIDAY tools as a standalone MCP server:
+
+```bash
+python mcp_server.py
+```
+
+## Architecture Notes
+- `main.py` now owns the async orchestration loop and tool execution flow.
+- `mcp_server.py` registers `web_research`, `mac_controller`, `schedule_handler`, and `vision_capture`.
+- `brain.py` plans tool calls and synthesizes final spoken replies for Gemini.
+- `memory_store.py` provides short-term semantic memory and long-term fact memory with ChromaDB, plus an in-memory fallback.
+- `vision_agent.py` captures screenshots or webcam frames for multimodal prompts.
+- `voice.py` strips markdown, links, and technical debris before speaking, and supports interruption for barge-in.
