@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+
+# MacOS
+.DS_Store
+
+# Logs
+logs/*.log
+*.log
+
+# Project specific Data & Secrets
+data/credentials/token.json
+data/credentials/credentials.json
+data/memory/
+models/*.onnx
+models/*.json
+
+# Temporary files
+assets/audio/test*.mp3
+temp_audio.wav
