@@ -10,3 +10,4 @@ pyobjc-framework-Cocoa
 piper-tts
 chromadb
 sentence-transformers
+ddgs

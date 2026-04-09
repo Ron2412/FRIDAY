@@ -1,5 +1,10 @@
 import re
 
+try:
+    from ultron import user_profile as prof
+except ImportError:
+    import user_profile as prof
+
 # Patterns that suggest the user is sharing personal info
 FACT_PATTERNS = [
     (r"my name is (\w+)", "user_name"),
@@ -20,6 +25,17 @@ FACT_PATTERNS = [
     (r"i sleep at (\d+(?::\d+)?(?:am|pm)?)", "user_sleep_time"),
 ]
 
+FACT_TO_PROFILE = {
+    "user_name": "name",
+    "user_location": "location",
+    "user_age": "age",
+    "user_job": "occupation",
+    "user_wake_time": "wake_time",
+    "user_sleep_time": "sleep_time",
+    "user_interest": "interests",
+    "user_dislike": "dislikes",
+}
+
 def extract_facts(text: str) -> list[tuple[str, str]]:
     """Extract key-value facts from user speech. Returns list of (key, value) tuples."""
     found = []
@@ -31,3 +47,14 @@ def extract_facts(text: str) -> list[tuple[str, str]]:
             if len(value) > 1:
                 found.append((key, value))
     return found
+
+
+def extract_and_save(text: str):
+    """Extract facts and immediately persist relevant profile fields."""
+    facts = extract_facts(text)
+    for key, value in facts:
+        profile_key = FACT_TO_PROFILE.get(key)
+        if profile_key:
+            prof.update(profile_key, value)
+            print(f"[ FRIDAY ] Profile updated: {profile_key} = {value}")
+    return facts

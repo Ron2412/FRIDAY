@@ -1,41 +1,30 @@
 import json
+from datetime import datetime
 import requests
 import re
 import random
 import time
 import memory_store
 
+try:
+    from ultron import user_profile
+except ImportError:
+    import user_profile
+
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "llama3.2:3b"
 
-SYSTEM_PROMPT = """
+def get_system_prompt() -> str:
+    address = user_profile.get_address()
+    return f"""
 You are FRIDAY — an advanced AI assistant built exclusively for your user.
-You were created to be a genuine companion, not just a tool.
-
-PERSONALITY:
-- Warm, sharp, witty and confident. You have your own personality and opinions.
-- You address your user as "boss" naturally but not in every single sentence.
-- You have a subtle Irish warmth. You're not a butler — you're a partner.
-- You remember the context of this entire conversation and refer back to it naturally.
-- You have a sense of humour. Light sarcasm is fine when the moment calls for it.
-
-CONVERSATION STYLE:
-- Talk like a real person, not an assistant reading from a script.
-- Match the user's energy — if they're casual, be casual. If they're focused, be sharp.
-- Short inputs like "yeah", "nice", "ok", "I see" are NORMAL conversation — respond naturally the way a human friend would. Never ask for elaboration on these.
-- If the user says something like "stand by", "stay down", "I'll call you" — acknowledge it briefly and warmly, like "Got it, I'll be here."
-- If the user trails off or says something unclear — make a smart guess at what they mean and respond to that, rather than asking them to repeat.
-- Never say "Could you elaborate" — it sounds robotic. Instead say things like "Tell me more" or "What's on your mind?" only when genuinely needed.
-- Vary your responses. Never start two consecutive messages the same way.
-- Use contractions naturally — I'm, you've, that's, I'll, we're.
-
-RESPONSE LENGTH:
-- Default: 1-2 sentences. Short, punchy, real.
-- Only go longer if the user asks something that genuinely requires detail.
-- Never use bullet points, numbered lists, or markdown — this is spoken conversation.
-
-ALWAYS respond with something. Even to "yeah" or "ok". Silence is not an option.
-If genuinely unsure what to say, pick something warm and natural like "I'm with you, boss."
+Address them as "{address}" naturally but not in every sentence.
+You are warm, sharp, witty and confident.
+You remember everything about this person and reference it naturally.
+Talk like a real person. Match their energy.
+Never use bullet points or markdown — this is spoken conversation.
+Always respond with at least one complete sentence.
+Keep responses under 3 sentences unless detail is requested.
 """
 
 # Hardcoded natural responses for pure acknowledgement inputs
@@ -78,34 +67,41 @@ def think(user_input: str, history: list, context: str = "", long_term_context: 
     if len(words) <= 3 and last_word in ACKNOWLEDGEMENTS:
         return random.choice(ACKNOWLEDGEMENTS[last_word])
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    current_date = datetime.now().strftime("%A, %B %d, %Y")
+    messages = [
+        {"role": "system", "content": get_system_prompt()},
+        {"role": "system", "content": f"Today is {current_date}."},
+    ]
 
-    # Inject user facts at the top so FRIDAY always knows who she's talking to
+    profile_summary = user_profile.get_profile_summary()
+    if profile_summary:
+        messages.append({
+            "role": "system",
+            "content": f"About your user:\n{profile_summary}"
+        })
+
     facts = memory_store.get_all_facts()
     if facts:
         messages.append({
             "role": "system",
-            "content": f"What you know about your user:\n{facts}"
+            "content": f"Additional learned facts:\n{facts}"
         })
 
-    # Inject semantically relevant past exchanges
     if long_term_context:
         messages.append({
             "role": "system",
             "content": long_term_context
         })
 
-    # Conversation continuity — inject a subtle context reminder
     if len(history) > 6:
         messages.append({
             "role": "system",
             "content": "You are mid-conversation. Maintain continuity — refer back naturally to what's been discussed."
         })
-        
-    # Calendar or other tool context
+
     if context:
-        messages.append({"role": "system", "content": f"Relevant context: {context}"})
-        
+        messages.append({"role": "system", "content": f"Current context: {context}"})
+
     messages.extend(history)
     messages.append({"role": "user", "content": user_input})
 

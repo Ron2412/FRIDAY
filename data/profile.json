@@ -1,0 +1,19 @@
+{
+  "name": "just",
+  "preferred_name": "Surf",
+  "location": null,
+  "timezone": null,
+  "age": null,
+  "occupation": null,
+  "wake_time": null,
+  "sleep_time": null,
+  "interests": [],
+  "dislikes": [],
+  "language": "en",
+  "response_style": "balanced",
+  "created_at": "2026-04-09T18:21:58.719182",
+  "last_seen": "2026-04-09T20:39:46.412938",
+  "total_sessions": 6,
+  "total_exchanges": 28,
+  "notes": []
+}
